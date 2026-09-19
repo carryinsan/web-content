@@ -1,0 +1,10 @@
+{
+"name": "web-tacker",
+"version": "1.0.0",
+"description": "High-concurrency web search and deep content extraction via parallel spoofed routing.",
+"type": "module",
+"scripts": {
+"start": "node api/combine.js"
+},
+"dependencies": {}
+}
