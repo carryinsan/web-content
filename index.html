@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Tacker - Combined Search & Extraction API</title>
+    <style>
+        :root {
+            --bg-dark: #0a0e17;
+            --card-bg: #111827;
+            --text-main: #e5e7eb;
+            --text-muted: #9ca3af;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --border-color: #1f2937;
+            --success: #10b981;
+            --error: #ef4444;
+            --warning: #f59e0b;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+        }
+
+        @media (min-width: 900px) {
+            .container {
+                grid-template-columns: 350px 1fr;
+            }
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        h1, h2, h3 { margin-top: 0; }
+        
+        .title-gradient {
+            background: -webkit-linear-gradient(45deg, #3b82f6, #8b5cf6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .input-group { margin-bottom: 15px; }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+            color: var(--text-muted);
+        }
+
+        input[type="text"], input[type="number"], select {
+            width: 100%;
+            padding: 10px;
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            border-radius: 6px;
+            box-sizing: border-box;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        button:hover { background: var(--accent-hover); }
+        button:disabled { background: var(--border-color); cursor: not-allowed; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .stat-box {
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-value { font-size: 1.5em; font-weight: bold; }
+        .stat-label { font-size: 0.8em; color: var(--text-muted); text-transform: uppercase; }
+
+        .result-item {
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+
+        .result-title {
+            font-weight: bold;
+            color: var(--accent);
+            text-decoration: none;
+            font-size: 1.1em;
+        }
+
+        .result-url {
+            font-size: 0.8em;
+            color: var(--text-muted);
+            word-break: break-all;
+        }
+
+        .badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            font-weight: bold;
+        }
+
+        .badge.success { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+        .badge.error { background: rgba(239, 68, 68, 0.2); color: var(--error); }
+        .badge.warning { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
+
+        .content-preview {
+            font-family: monospace;
+            background: #000;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            max-height: 150px;
+            overflow-y: auto;
+            color: #a3a3a3;
+            white-space: pre-wrap;
+            margin-top: 10px;
+        }
+
+        .error-text { color: var(--error); font-size: 0.9em; margin-top: 5px; }
+
+        .tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            color: var(--text-muted);
+            border-bottom: 2px solid transparent;
+        }
+
+        .tab.active {
+            color: var(--text-main);
+            border-bottom-color: var(--accent);
+        }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        pre {
+            background: #000;
+            padding: 15px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 0.9em;
+            color: #d1d5db;
+        }
+        
+        .code-block {
+            border-left: 3px solid var(--accent);
+            padding-left: 15px;
+            margin: 10px 0;
+            background: rgba(59, 130, 246, 0.1);
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <!-- Left Sidebar: Controls -->
+    <div class="card">
+        <h1 class="title-gradient">Web Tacker</h1>
+        <p style="font-size: 0.9em; color: var(--text-muted);">High-Concurrency Combined API</p>
+
+        <form id="search-form">
+            <div class="input-group">
+                <label for="query">Search Query</label>
+                <input type="text" id="query" placeholder="e.g., Latest AI frameworks" required>
+            </div>
+
+            <div class="input-group">
+                <label for="count">Max Results</label>
+                <input type="number" id="count" value="10" min="1" max="40">
+            </div>
+
+            <div class="input-group">
+                <label for="action">Action Type</label>
+                <select id="action">
+                    <option value="auto">Auto (Search + Extract All)</option>
+                    <option value="search">Search Only (No Extraction)</option>
+                </select>
+            </div>
+
+            <button type="submit" id="submit-btn">Execute API Request</button>
+        </form>
+
+        <div id="loading-indicator" style="display: none; margin-top: 15px; text-align: center; color: var(--accent);">
+            Processing highly concurrent request...<br>
+            <small style="color: var(--text-muted)">(Max timeout: 15s)</small>
+        </div>
+    </div>
+
+    <!-- Right Main Area -->
+    <div class="card">
+        <div class="tabs">
+            <div class="tab active" data-target="results-view">Visual Results</div>
+            <div class="tab" data-target="json-view">Raw JSON</div>
+            <div class="tab" data-target="docs-view">Developer Guide</div>
+        </div>
+
+        <!-- Visual Results Tab -->
+        <div id="results-view" class="tab-content active">
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-time">- ms</div>
+                    <div class="stat-label">Total Latency</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-total">-</div>
+                    <div class="stat-label">Total URLs</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" style="color: var(--success);" id="stat-success">-</div>
+                    <div class="stat-label">Extracted</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" style="color: var(--error);" id="stat-failed">-</div>
+                    <div class="stat-label">Failed</div>
+                </div>
+            </div>
+
+            <div id="results-container">
+                <p style="color: var(--text-muted); text-align: center; margin-top: 50px;">
+                    Enter a query and execute the API to see parallel extraction results here.
+                </p>
+            </div>
+        </div>
+
+        <!-- Raw JSON Tab -->
+        <div id="json-view" class="tab-content">
+            <pre id="json-output">Execute a request to see the raw JSON response.</pre>
+        </div>
+
+        <!-- Developer Guide Tab -->
+        <div id="docs-view" class="tab-content">
+            <h2>Developer Guide: Injecting Sources into AI</h2>
+            <p>The Web Tacker API is designed specifically to act as an aggressive, high-concurrency fetching layer for AI applications (like RAG systems). It combines discovery (search) and deep extraction into a single, time-bounded edge request.</p>
+
+            <h3>How to use it in your AI App</h3>
+            <p>When a user asks your AI a question requiring web context, construct a query and call this API:</p>
+            
+            <pre><code>const response = await fetch('https://[YOUR_VERCEL_DOMAIN]/api/combine?query=latest+spacex+launch&count=10');
+const data = await response.json();
+
+// 1. Check for global success
+if (!data.success) {
+    console.error("Critical failure:", data.error);
+    return;
+}
+
+// 2. Filter out failed extractions (sites that blocked the scraper)
+const validSources = data.results.filter(item => 
+    item.extraction && item.extraction.success
+);
+
+// 3. Format the clean text for your LLM context window
+let aiContext = "Here is the latest web information:\n\n";
+validSources.forEach((source, index) => {
+    // Truncate content to save tokens!
+    const cleanText = source.extraction.content.substring(0, 1500); 
+    aiContext += `[Source ${index + 1}: ${source.url}]\n${cleanText}\n\n`;
+});
+
+// 4. Send aiContext to your LLM...
+</code></pre>
+
+            <h3 style="color: var(--warning); margin-top: 30px;">Critical Constraints & Safeguards</h3>
+            <div class="code-block">
+                <strong>1. The 15-Second Edge Limit:</strong><br>
+                Vercel Free/Pro Edge functions have a hard kill-switch at 10-15 seconds. This API has an internal failsafe that triggers at <strong>14.5 seconds</strong>. If you request 50 extractions and 45 finish in time, the API will abort the remaining 5 and immediately return a <code>HTTP 200</code> with the 45 successful results rather than letting Vercel throw a 504 Timeout error.
+            </div>
+            
+            <div class="code-block">
+                <strong>2. Handling Failed Extractions:</strong><br>
+                Because this API uses parallel execution, one blocked site will <em>not</em> crash the others. However, you <strong>must</strong> check <code>item.extraction.success === true</code> before trying to read <code>item.extraction.content</code>. Sites heavily protected by Cloudflare JS challenges may fail and will have <code>success: false</code>.
+            </div>
+
+             <div class="code-block">
+                <strong>3. Token Limits:</strong><br>
+                This API attempts to strip HTML to return raw text, but web pages can be massive. You are responsible for chunking or truncating <code>item.extraction.content</code> on your server before sending it to OpenAI/Anthropic to avoid exceeding token context limits.
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Tab switching logic
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            tab.classList.add('active');
+            document.getElementById(tab.dataset.target).classList.add('active');
+        });
+    });
+
+    // Form submission logic
+    document.getElementById('search-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        const query = document.getElementById('query').value;
+        const count = document.getElementById('count').value;
+        const action = document.getElementById('action').value;
+        const btn = document.getElementById('submit-btn');
+        const loader = document.getElementById('loading-indicator');
+        const resultsContainer = document.getElementById('results-container');
+        const jsonOutput = document.getElementById('json-output');
+
+        // Reset UI
+        btn.disabled = true;
+        loader.style.display = 'block';
+        resultsContainer.innerHTML = '';
+        jsonOutput.textContent = 'Fetching...';
+        document.getElementById('stat-time').textContent = '- ms';
+        document.getElementById('stat-total').textContent = '-';
+        document.getElementById('stat-success').textContent = '-';
+        document.getElementById('stat-failed').textContent = '-';
+
+        try {
+            // Build the URL (Using relative path as it will be deployed together)
+            const url = `/api/combine?query=${encodeURIComponent(query)}&count=${count}&action=${action}`;
+            
+            const response = await fetch(url);
+            const data = await response.json();
+
+            // Populate Raw JSON
+            jsonOutput.textContent = JSON.stringify(data, null, 2);
+
+            // Populate Stats
+            document.getElementById('stat-time').textContent = `${data.total_time_ms || 0} ms`;
+            
+            if (data.success && data.results) {
+                document.getElementById('stat-total').textContent = data.results.length;
+                
+                if (action === 'auto') {
+                    const failedCount = data.failed_extractions || 0;
+                    const successCount = data.results.length - failedCount;
+                    document.getElementById('stat-success').textContent = successCount;
+                    document.getElementById('stat-failed').textContent = failedCount;
+                } else {
+                    document.getElementById('stat-success').textContent = 'N/A';
+                    document.getElementById('stat-failed').textContent = 'N/A';
+                }
+
+                // Render Visual Results
+                if (data.results.length === 0) {
+                    resultsContainer.innerHTML = '<p style="text-align: center;">No results found.</p>';
+                } else {
+                    data.results.forEach((item, index) => {
+                        const div = document.createElement('div');
+                        div.className = 'result-item';
+                        
+                        let badgeHtml = '';
+                        let contentHtml = '';
+
+                        if (action === 'auto' && item.extraction) {
+                            if (item.extraction.success) {
+                                badgeHtml = `<span class="badge success">Extracted (${item.extraction.latency}ms)</span>`;
+                                // Truncate content for preview
+                                const preview = item.extraction.content.substring(0, 300) + '...';
+                                contentHtml = `<div class="content-preview">${escapeHtml(preview)}</div>`;
+                            } else {
+                                badgeHtml = `<span class="badge error">Failed (${item.extraction.latency}ms)</span>`;
+                                contentHtml = `<div class="error-text">Reason: ${escapeHtml(item.extraction.error)}</div>`;
+                            }
+                        } else {
+                            badgeHtml = `<span class="badge warning">Search Only</span>`;
+                            contentHtml = `<div style="margin-top: 10px; font-size: 0.9em; color: var(--text-muted);">${escapeHtml(item.snippet || 'No snippet')}</div>`;
+                        }
+
+                        div.innerHTML = `
+                            <div class="result-header">
+                                <div>
+                                    <div style="font-size: 0.8em; color: var(--text-muted);">Result #${index + 1}</div>
+                                    <a href="${item.url}" target="_blank" class="result-title">${escapeHtml(item.title || 'Unknown Title')}</a>
+                                </div>
+                                ${badgeHtml}
+                            </div>
+                            <div class="result-url">${escapeHtml(item.url)}</div>
+                            ${contentHtml}
+                        `;
+                        resultsContainer.appendChild(div);
+                    });
+                }
+            } else {
+                // Global API Error
+                resultsContainer.innerHTML = `
+                    <div style="background: rgba(239, 68, 68, 0.1); border-left: 4px solid var(--error); padding: 15px; border-radius: 4px;">
+                        <h3 style="color: var(--error); margin: 0 0 10px 0;">API Execution Failed</h3>
+                        <p style="margin: 0;">${escapeHtml(data.error || 'Unknown error occurred.')}</p>
+                    </div>
+                `;
+            }
+
+        } catch (error) {
+            resultsContainer.innerHTML = `<p style="color: var(--error);">Network Error: ${error.message}</p>`;
+            jsonOutput.textContent = `Error: ${error.message}`;
+        } finally {
+            btn.disabled = false;
+            loader.style.display = 'none';
+        }
+    });
+
+    // Helper to prevent XSS in rendering
+    function escapeHtml(unsafe) {
+        if (!unsafe) return '';
+        return unsafe
+             .replace(/&/g, "&amp;")
+             .replace(/</g, "&lt;")
+             .replace(/>/g, "&gt;")
+             .replace(/"/g, "&quot;")
+             .replace(/'/g, "&#039;");
+    }
+</script>
+</body>
+</html>
