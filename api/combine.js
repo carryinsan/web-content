@@ -33,13 +33,33 @@ function getRandomUserAgent() {
     return uas[Math.floor(Math.random() * uas.length)];
 }
 
+// Helper: Fetch with a localized timeout so one bad request doesn't hang the loop
+async function fetchWithTimeout(resource, options = {}, timeoutMs, globalSignal) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    
+    // If the global 14.5s timeout fires, abort this local fetch too
+    if (globalSignal) {
+        globalSignal.addEventListener('abort', () => controller.abort());
+    }
+    
+    try {
+        const response = await fetch(resource, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+    } catch (error) {
+        clearTimeout(id);
+        throw error;
+    }
+}
+
 // Step 1: Perform the search
 async function performSearch(query, count, signal) {
     const spoofedIP = getRandomIP();
     const targetUrl = `${CRAWLER_URL}?query=${encodeURIComponent(query)}&count=${count}`;
     
     try {
-        const res = await fetch(targetUrl, {
+        const res = await fetchWithTimeout(targetUrl, {
             method: 'GET',
             headers: {
                 'X-Forwarded-For': spoofedIP,
@@ -47,9 +67,8 @@ async function performSearch(query, count, signal) {
                 'Client-IP': spoofedIP,
                 'User-Agent': getRandomUserAgent(),
                 'Accept': 'application/json'
-            },
-            signal
-        });
+            }
+        }, 8000, signal); // 8s max for search
         
         if (!res.ok) throw new Error(`Crawler API returned status: ${res.status}`);
         const data = await res.json();
@@ -60,46 +79,73 @@ async function performSearch(query, count, signal) {
     }
 }
 
-// Step 2: Extract content (Designed to run in parallel without blocking others)
+// Step 2: Extract content (Direct Jina bypass + Fallback to Content Tacker)
 async function extractContent(url, signal) {
     const spoofedIP = getRandomIP();
-    const targetUrl = `${EXTRACTOR_URL}?url=${encodeURIComponent(url)}`;
-    
+    const userAgent = getRandomUserAgent();
     const startTime = Date.now();
+    let debugLog = { method: "None", errors: [] };
+
+    // --- NEW: DIRECT TIER 1 JINA FETCH ---
+    // We do this here so we can pass the spoofed IP directly to Jina.
     try {
-        const res = await fetch(targetUrl, {
+        const jinaUrl = `https://r.jina.ai/${encodeURIComponent(url)}`;
+        const jinaRes = await fetchWithTimeout(jinaUrl, {
             method: 'GET',
             headers: {
                 'X-Forwarded-For': spoofedIP,
                 'X-Real-IP': spoofedIP,
-                'Client-IP': spoofedIP,
-                'User-Agent': getRandomUserAgent(),
+                'Accept': 'text/plain',
+                'User-Agent': userAgent
+            }
+        }, 5000, signal); // 5 seconds max for Jina
+
+        if (jinaRes.ok) {
+            let text = await jinaRes.text();
+            if (text && text.length > 100 && !text.includes("Cloudflare") && !text.includes("Just a moment...")) {
+                text = text.replace(/\[.*?\]\(.*?\)/g, ''); // Strip markdown links for cleaner text
+                return { 
+                    url, success: true, content: text, debug: { method: "Tier 1: Direct Jina proxy", errors: [] }, latency: Date.now() - startTime 
+                };
+            } else {
+                debugLog.errors.push("Jina returned empty or cloudflare blocked.");
+            }
+        } else {
+            debugLog.errors.push(`Jina failed with status: ${jinaRes.status}`);
+        }
+    } catch (err) {
+        debugLog.errors.push(`Tier 1 Direct Failed: ${err.message}`);
+    }
+
+    // --- FALLBACK: TIER 2 & 3 via CONTENT TACKER ---
+    // If Jina blocks us, we fall back to your cheerio/regex scraper.
+    try {
+        const targetUrl = `${EXTRACTOR_URL}?url=${encodeURIComponent(url)}`;
+        const res = await fetchWithTimeout(targetUrl, {
+            method: 'GET',
+            headers: {
+                'X-Forwarded-For': spoofedIP,
+                'X-Real-IP': spoofedIP,
+                'User-Agent': userAgent,
                 'Accept': 'application/json'
-            },
-            signal
-        });
+            }
+        }, 6000, signal); // 6 seconds max for fallback
         
         const data = await res.json();
         
         if (!data.success) {
-            return { url, success: false, content: null, error: data.error, latency: Date.now() - startTime };
+            debugLog.errors.push(...(data.debug?.errors || [data.error]));
+            return { url, success: false, content: null, error: "All tiers failed.", debug: debugLog, latency: Date.now() - startTime };
         }
         
         return { 
-            url, 
-            success: true, 
-            content: data.text, 
-            debug: data.debug,
-            latency: Date.now() - startTime 
+            url, success: true, content: data.text, debug: data.debug, latency: Date.now() - startTime 
         };
     } catch (err) {
-        // Fail gracefully so other parallel requests continue seamlessly
         return {
-            url,
-            success: false,
-            content: null,
-            error: err.name === 'AbortError' ? 'Extraction timeout exceeded before completion.' : err.message,
-            latency: Date.now() - startTime
+            url, success: false, content: null,
+            error: err.name === 'AbortError' ? 'Extraction timeout exceeded.' : err.message,
+            debug: debugLog, latency: Date.now() - startTime
         };
     }
 }
@@ -124,24 +170,16 @@ export default async function handler(req) {
             input = Object.fromEntries(urlObj.searchParams.entries());
         }
 
-        // Available actions: 'auto' (search + extract), 'search' (search only), 'extract' (extract provided URLs)
         const action = input.action || 'auto'; 
         const count = parseInt(input.count || 20, 10);
         
         let finalPayload = { 
-            success: true, 
-            action, 
-            results: [], 
-            failed_extractions: 0, 
-            total_time_ms: 0 
+            success: true, action, results: [], failed_extractions: 0, total_time_ms: 0 
         };
 
         if (action === 'search' || action === 'auto') {
-            if (!input.query) {
-                throw new Error("Missing 'query' parameter for search.");
-            }
+            if (!input.query) throw new Error("Missing 'query' parameter.");
             
-            // Phase A: Get URLs
             const searchData = await performSearch(input.query, count, controller.signal);
             let searchResults = searchData.results || [];
             
@@ -149,7 +187,6 @@ export default async function handler(req) {
                 finalPayload.results = searchResults;
             } 
             
-            // Phase B: Auto Extract (Massively Parallel)
             if (action === 'auto') {
                 const extractionPromises = searchResults.map(async (res) => {
                     const ext = await extractContent(res.url, controller.signal);
@@ -162,16 +199,13 @@ export default async function handler(req) {
         } 
         else if (action === 'extract') {
             if (!input.urls || !Array.isArray(input.urls)) {
-                throw new Error("Missing 'urls' array parameter for extraction.");
+                throw new Error("Missing 'urls' array parameter.");
             }
-            
-            // Phase B (Standalone): Extract directly from user-provided URLs in parallel
             const extractionPromises = input.urls.map(async (url) => {
                 const ext = await extractContent(url, controller.signal);
                 if (!ext.success) finalPayload.failed_extractions++;
                 return { url, extraction: ext };
             });
-            
             finalPayload.results = await Promise.all(extractionPromises);
         } else {
             throw new Error("Invalid action. Use 'auto', 'search', or 'extract'.");
@@ -180,21 +214,14 @@ export default async function handler(req) {
         clearTimeout(globalTimeoutId);
         finalPayload.total_time_ms = Date.now() - startOverallTime;
 
-        return new Response(JSON.stringify(finalPayload), {
-            status: 200,
-            headers: CORS_HEADERS
-        });
+        return new Response(JSON.stringify(finalPayload), { status: 200, headers: CORS_HEADERS });
 
     } catch (err) {
         clearTimeout(globalTimeoutId);
-        
         return new Response(JSON.stringify({
             success: false,
             error: err.name === 'AbortError' ? 'Global timeout (15s) reached. The request was halted to prevent server failure.' : err.message,
             total_time_ms: Date.now() - startOverallTime
-        }), {
-            status: 200, // Returning 200 guarantees the frontend can beautifully parse the JSON error
-            headers: CORS_HEADERS
-        });
+        }), { status: 200, headers: CORS_HEADERS });
     }
 }
