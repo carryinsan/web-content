@@ -5,8 +5,8 @@ export const config = {
 const CRAWLER_URL = 'https://web-crawler-pink.vercel.app/api/crawler';
 const EXTRACTOR_URL = 'https://content-tacker.vercel.app/api/extract';
 
-// Strict 14-second timeout. Guarantees a safe JSON return before Vercel's 15s hard limit.
-const TOTAL_TIMEOUT_MS = 14000; 
+// Generous 28-second timeout for the edge function to maximize success rate
+const TOTAL_TIMEOUT_MS = 28000; 
 
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
@@ -20,7 +20,6 @@ async function fetchWithTimeout(resource, options = {}, timeoutMs, globalSignal)
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
     
-    // If the global timeout fires, abort this local fetch too
     if (globalSignal) {
         globalSignal.addEventListener('abort', () => controller.abort());
     }
@@ -43,68 +42,46 @@ async function performSearch(query, count, signal) {
         const res = await fetchWithTimeout(targetUrl, {
             method: 'GET',
             headers: { 'Accept': 'application/json' }
-        }, 6000, signal); 
+        }, 10000, signal); 
         
-        const text = await res.text();
-        
-        if (!res.ok) throw new Error(`Crawler API returned status: ${res.status}. Body: ${text.substring(0, 100)}`);
-        
-        try {
-            return JSON.parse(text);
-        } catch (e) {
-            throw new Error(`Crawler returned invalid JSON.`);
-        }
+        if (!res.ok) throw new Error(`Crawler API returned status: ${res.status}`);
+        return await res.json();
     } catch (err) {
         if (err.name === 'AbortError') throw new Error('Search phase timed out.');
         throw err;
     }
 }
 
-// Step 2: Extract content in parallel
-async function extractContent(url, signal, maxTimeoutMs) {
+// Step 2: Extract content (Delegates to content-tacker)
+async function extractContent(url, signal) {
     const startTime = Date.now();
 
     try {
         const targetUrl = `${EXTRACTOR_URL}?url=${encodeURIComponent(url)}`;
         
+        // Massive 25-second timeout to let content-tacker do proxy work safely
         const res = await fetchWithTimeout(targetUrl, {
             method: 'GET',
             headers: { 'Accept': 'application/json' }
-        }, maxTimeoutMs, signal); 
+        }, 25000, signal); 
         
-        const text = await res.text();
-        let data;
-        
-        try {
-            data = JSON.parse(text);
-        } catch (e) {
-            throw new Error(`Extractor returned invalid JSON (Status ${res.status}).`);
-        }
+        const data = await res.json();
         
         if (!data.success) {
             return { 
-                url, 
-                success: false, 
-                content: null, 
-                error: data.error, 
-                debug: data.debug, 
-                latency: Date.now() - startTime 
+                url, success: false, content: null, 
+                error: data.error, debug: data.debug, latency: Date.now() - startTime 
             };
         }
         
         return { 
-            url, 
-            success: true, 
-            content: data.text, 
-            debug: data.debug, 
-            latency: Date.now() - startTime 
+            url, success: true, content: data.text, 
+            debug: data.debug, latency: Date.now() - startTime 
         };
     } catch (err) {
         return {
-            url, 
-            success: false, 
-            content: null,
-            error: err.name === 'AbortError' ? `Extraction timeout exceeded.` : err.message,
+            url, success: false, content: null,
+            error: err.name === 'AbortError' ? 'Extraction timeout exceeded.' : err.message,
             debug: { method: "None", errors: [err.message] }, 
             latency: Date.now() - startTime
         };
@@ -112,33 +89,34 @@ async function extractContent(url, signal, maxTimeoutMs) {
 }
 
 export default async function handler(req) {
-    // 1. Handle CORS Preflight Requests
     if (req.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // 2. Global Abort Controller to ensure we return safely before Vercel kills the function
     const controller = new AbortController();
     const globalTimeoutId = setTimeout(() => controller.abort(), TOTAL_TIMEOUT_MS);
     const startOverallTime = Date.now();
 
     try {
         let input = {};
+        const urlObj = new URL(req.url);
+        const queryParams = Object.fromEntries(urlObj.searchParams.entries());
+
         if (req.method === 'POST') {
             try {
                 input = await req.json();
             } catch (e) {
-                // Ignore empty bodies
+                // Ignore empty POST bodies safely
             }
-        } else {
-            const urlObj = new URL(req.url);
-            input = Object.fromEntries(urlObj.searchParams.entries());
         }
+
+        // Merge inputs, giving priority to POST body but retaining URL params
+        input = { ...queryParams, ...input };
 
         const action = input.action || 'auto'; 
         const count = parseInt(input.count || 20, 10);
         
-        // Flexible query matching to prevent "Missing query" errors
+        // Universal query mapping to prevent "Missing query" errors!
         const query = input.query || input.q || input.search;
         
         let finalPayload = { 
@@ -147,10 +125,7 @@ export default async function handler(req) {
 
         if (action === 'search' || action === 'auto') {
             if (!query) {
-                return new Response(JSON.stringify({ 
-                    success: false, 
-                    error: "Missing 'query' parameter. Please provide a ?query=... in the URL." 
-                }), { status: 400, headers: CORS_HEADERS });
+                throw new Error("Missing 'query' parameter. Please pass ?query=YOUR_SEARCH in the URL.");
             }
             
             const searchData = await performSearch(query, count, controller.signal);
@@ -161,17 +136,9 @@ export default async function handler(req) {
             } 
             
             if (action === 'auto') {
-                // TRUE PARALLELIZATION: No batching! Fire all requests simultaneously!
-                const timeElapsed = Date.now() - startOverallTime;
-                let timeLeft = TOTAL_TIMEOUT_MS - timeElapsed;
-                
-                // Give extraction minimum 2 seconds to attempt, otherwise safely abort
-                if (timeLeft < 2000) timeLeft = 2000; 
-                const extractionTimeout = timeLeft - 500; 
-
-                // Fire 59+ requests at the exact same time
+                // TRUE PARALLELIZATION: Fire all extractions at the exact same time
                 const extractionPromises = searchResults.map(async (res) => {
-                    const ext = await extractContent(res.url, controller.signal, extractionTimeout);
+                    const ext = await extractContent(res.url, controller.signal);
                     if (!ext.success) finalPayload.failed_extractions++;
                     return { ...res, extraction: ext };
                 });
@@ -181,22 +148,16 @@ export default async function handler(req) {
         } 
         else if (action === 'extract') {
             if (!input.urls || !Array.isArray(input.urls)) {
-                return new Response(JSON.stringify({ 
-                    success: false, 
-                    error: "Missing 'urls' array parameter for extraction." 
-                }), { status: 400, headers: CORS_HEADERS });
+                throw new Error("Missing 'urls' array parameter for extraction.");
             }
             const extractionPromises = input.urls.map(async (url) => {
-                const ext = await extractContent(url, controller.signal, TOTAL_TIMEOUT_MS - 500);
+                const ext = await extractContent(url, controller.signal);
                 if (!ext.success) finalPayload.failed_extractions++;
                 return { url, extraction: ext };
             });
             finalPayload.results = await Promise.all(extractionPromises);
         } else {
-            return new Response(JSON.stringify({ 
-                success: false, 
-                error: "Invalid action. Use 'auto', 'search', or 'extract'." 
-            }), { status: 400, headers: CORS_HEADERS });
+            throw new Error("Invalid action. Use 'auto', 'search', or 'extract'.");
         }
 
         clearTimeout(globalTimeoutId);
@@ -208,8 +169,8 @@ export default async function handler(req) {
         clearTimeout(globalTimeoutId);
         return new Response(JSON.stringify({
             success: false,
-            error: err.name === 'AbortError' ? 'Global timeout reached. Safely aborted to prevent 504 server crash.' : err.message,
+            error: err.name === 'AbortError' ? 'Global timeout reached. Safely halted.' : err.message,
             total_time_ms: Date.now() - startOverallTime
-        }), { status: 200, headers: CORS_HEADERS });
+        }), { status: 200, headers: CORS_HEADERS }); // Return 200 to prevent frontend crashes
     }
 }
