@@ -1,0 +1,20 @@
+{
+"version": 2,
+"rewrites": [
+{
+"source": "/api/combine",
+"destination": "/api/combine.js"
+}
+],
+"headers": [
+{
+"source": "/api/combine",
+"headers": [
+{
+"key": "Access-Control-Allow-Origin",
+"value": "*"
+}
+]
+}
+]
+}
