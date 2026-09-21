@@ -1,6 +1,6 @@
 /*
  * ArixAI Combined Search + Crawler-Guided Content Extractor
- * v3.1.0 — Moderate filtering, crawler-native relevance, fail-safe parallel extraction
+ * v3.2.1 — Moderate filtering, crawler-native relevance, aligned ranks, faster critical path
  *
  * DROP-IN replacement for: api/combine.js
  * Runtime: Vercel Edge
@@ -35,14 +35,18 @@ const TOTAL_TIMEOUT_MS = 20000;
 const SEARCH_TIMEOUT_MS = 6000;
 const PREFLIGHT_TIMEOUT_MS = 1100;
 const EXTRACTION_TIMEOUT_MS = 9500;
-const JINA_FALLBACK_TIMEOUT_MS = 3200;
+const JINA_FALLBACK_TIMEOUT_MS = 2400;
 
 // Do not slash the result set. Keep a healthy number of positive candidates.
 const MAX_AUTO_CANDIDATES = 32;
 const MAX_HOSTS_PER_SOURCE = 8;
-const MAX_JINA_FALLBACKS = 4;
+const MAX_JINA_FALLBACKS = 3;
 const MAX_CRAWLER_RESULTS = 40;
 const DEFAULT_COUNT = 20;
+
+// A crawler result that already contains trustworthy page text can be reused
+// directly instead of making a second network extraction request.
+const MIN_REUSABLE_CRAWLER_TEXT = 400;
 
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
@@ -343,6 +347,7 @@ function normalizeSearchResults(searchData) {
             ...item,
             url: urlInfo.url,
             _originalRank: Number(item.rank) || i + 1,
+            crawlerRank: Number(item.rank) || i + 1,
         });
     }
 
@@ -639,6 +644,37 @@ async function extractWithContentTacker(url, globalSignal) {
     }
 }
 
+function getCrawlerPageContent(item) {
+    if (!item || typeof item !== 'object') return '';
+    const candidates = [
+        item.contentForAI,
+        item.pageContent,
+        item.extractedText,
+    ];
+    for (const value of candidates) {
+        const text = normalizeText(value, 500000);
+        if (text.length >= MIN_REUSABLE_CRAWLER_TEXT && !contentLooksBlocked(text)) {
+            return text;
+        }
+    }
+    return '';
+}
+
+function crawlerContentExtraction(item) {
+    const text = getCrawlerPageContent(item);
+    if (!text) return null;
+    return {
+        url: item.url,
+        success: true,
+        content: text,
+        debug: {
+            method: 'crawler-native-content',
+            contentLength: text.length,
+        },
+        latency: 0,
+    };
+}
+
 function contentLooksBlocked(text, debugText = '') {
     const sample = `${normalizeText(text, 9000)} ${normalizeText(debugText, 3500)}`.toLowerCase();
     if (!sample) return false;
@@ -729,34 +765,68 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
     const normalized = normalizeSearchResults(searchData);
     const selected = selectCandidates(normalized);
 
-    // Soft preflight only for candidates whose crawler response did not already
-    // give us a status. Known-good 200s go straight to extraction for speed.
-    const preflightEligible = selected.selected.filter(entry => {
+    // Reuse content already extracted by the crawler when it is substantial and
+    // not obviously a challenge page. This removes an unnecessary network hop.
+    const reusable = [];
+    const networkEntries = [];
+    for (const entry of selected.selected) {
+        const existing = crawlerContentExtraction(entry.item);
+        if (existing) reusable.push({ entry, ext: existing });
+        else networkEntries.push(entry);
+    }
+
+    // Only candidates with no crawler HTTP status need a soft preflight. Start
+    // extraction of known-good pages immediately instead of waiting for every
+    // preflight to finish. This shortens the critical path without relaxing the
+    // crawler's relevance decisions.
+    const preflightEligible = networkEntries.filter(entry => {
         const status = Number(entry.item.httpStatus);
         return !Number.isFinite(status) || status <= 0;
     });
 
-    const preflightMap = new Map();
-    if (remainingMs(startOverallTime) > 3500 && preflightEligible.length) {
-        const probes = await Promise.all(preflightEligible.map(async entry => {
+    const preflightPromise = (remainingMs(startOverallTime) > 2800 && preflightEligible.length)
+        ? Promise.all(preflightEligible.map(async entry => {
             const result = await preflightUrl(entry.item.url, globalSignal);
             return [entry.item.url, result];
-        }));
-        for (const [url, result] of probes) preflightMap.set(url, result);
-    }
+        }))
+        : Promise.resolve([]);
 
-    // A preflight only removes a candidate when it positively proves an obvious
-    // blocker/redirect. Timeout or network errors remain eligible.
-    const extractionEntries = selected.selected.filter(entry => {
-        const pf = preflightMap.get(entry.item.url);
-        if (!pf) return true;
-        return pf.ok !== false;
+    const directEntries = networkEntries.filter(entry => {
+        const status = Number(entry.item.httpStatus);
+        return Number.isFinite(status) && status > 0;
     });
 
-    const extractionResults = await Promise.all(extractionEntries.map(async entry => {
+    // Start known-status extraction now; it runs concurrently with preflight.
+    const directExtractionPromise = Promise.all(directEntries.map(async entry => {
         const ext = await extractWithContentTacker(entry.item.url, globalSignal);
         return { entry, ext };
     }));
+
+    const preflightPairs = await preflightPromise;
+    const preflightMap = new Map(preflightPairs);
+
+    const unknownEligible = preflightEligible.filter(entry => {
+        const pf = preflightMap.get(entry.item.url);
+        // A positive blocker/redirect is excluded. Timeout/network uncertainty is
+        // intentionally retained, preserving the moderate behavior.
+        return !pf || pf.ok !== false;
+    });
+
+    const unknownExtractionPromise = Promise.all(unknownEligible.map(async entry => {
+        const ext = await extractWithContentTacker(entry.item.url, globalSignal);
+        return { entry, ext };
+    }));
+
+    const [directResults, unknownResults] = await Promise.all([
+        directExtractionPromise,
+        unknownExtractionPromise,
+    ]);
+
+    const extractionResults = [
+        ...reusable,
+        ...directResults,
+        ...unknownResults,
+    ];
 
     const combined = extractionResults.map(({ entry, ext }) => ({
         ...entry.item,
@@ -769,10 +839,10 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         },
     }));
 
-    // Limited fallback for the strongest crawler-approved candidates that failed
-    // the primary extractor. This is deliberately small to protect latency.
+    // Limited fallback for failed primary extractions. Preserve crawler order;
+    // fallback is only for extraction resilience, never for relevance ranking.
     let fallbackUsed = 0;
-    const fallbacksAllowed = remainingMs(startOverallTime) > 4000 ? MAX_JINA_FALLBACKS : 0;
+    const fallbacksAllowed = remainingMs(startOverallTime) > 3000 ? MAX_JINA_FALLBACKS : 0;
 
     if (fallbacksAllowed > 0) {
         const failedIndexes = [];
@@ -780,7 +850,6 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
             if (!combined[i]?.extraction?.success) failedIndexes.push(i);
         }
 
-        // Preserve crawler order. No score-based re-ranking is introduced here.
         const fallbackResults = await Promise.all(failedIndexes.map(async index => {
             const item = combined[index];
             const ext = await extractWithJina(item.url, globalSignal);
@@ -805,21 +874,44 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         }
     }
 
-    let failed = 0;
+    // IMPORTANT: `rank` is now assigned only after extraction succeeds. This
+    // makes JSON rank exactly match the frontend's displayed 1..N source order.
+    // Failed pages are removed from `results`; diagnostics are kept separately.
+    const successful = [];
+    const failedResults = [];
     for (const item of combined) {
-        if (!item.extraction?.success) failed++;
         delete item._originalRank;
+        if (item.extraction?.success) {
+            successful.push(item);
+        } else {
+            // Failed pages are diagnostics only and must never carry a display rank.
+            delete item.rank;
+            failedResults.push(item);
+        }
+    }
+
+    successful.sort((a, b) => {
+        const ar = Number(a.rank) || 999999;
+        const br = Number(b.rank) || 999999;
+        return ar - br;
+    });
+    for (let i = 0; i < successful.length; i++) {
+        successful[i].rank = i + 1;
     }
 
     return {
-        results: combined,
+        results: successful,
+        failedResults,
         stats: {
             ...selected.stats,
+            crawlerContentReused: reusable.length,
             preflightChecked: preflightEligible.length,
             preflightRejected: [...preflightMap.values()].filter(v => v && v.ok === false).length,
-            extractionSent: extractionEntries.length,
+            extractionSent: directEntries.length + unknownEligible.length,
+            extractionSucceeded: successful.length,
+            extractionFailed: failedResults.length,
             fallbackAttempts: fallbackUsed,
-            failedExtractions: failed,
+            failedExtractions: failedResults.length,
             normalizedSources: normalized.length,
         },
     };
@@ -923,6 +1015,7 @@ export default async function handler(req) {
             } else {
                 const processed = await processAutoCandidates(String(query), searchData, controller.signal, startOverallTime);
                 finalPayload.results = processed.results;
+                finalPayload.failed_results = processed.failedResults;
                 finalPayload.failed_extractions = processed.stats.failedExtractions;
                 finalPayload.filter_stats = processed.stats;
                 finalPayload.crawler = {
