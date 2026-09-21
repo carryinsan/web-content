@@ -1,6 +1,6 @@
 /*
  * ArixAI Combined Search + Crawler-Guided Content Extractor
- * v3.2.1 — Moderate filtering, crawler-native relevance, aligned ranks, faster critical path
+ * v3.3.1 — Large wall-clock speed optimization with crawler-guided filtering
  *
  * DROP-IN replacement for: api/combine.js
  * Runtime: Vercel Edge
@@ -29,18 +29,27 @@ const JINA_READER_BASE = 'https://r.jina.ai/';
 
 // Moderate global budget. The old version could spend most of the request on
 // a small candidate set. 20s gives the extractor room without becoming slow.
-const TOTAL_TIMEOUT_MS = 20000;
+const TOTAL_TIMEOUT_MS = 15000;
 
 // Phase budgets. These are local caps; the global signal always wins.
-const SEARCH_TIMEOUT_MS = 6000;
-const PREFLIGHT_TIMEOUT_MS = 1100;
-const EXTRACTION_TIMEOUT_MS = 9500;
-const JINA_FALLBACK_TIMEOUT_MS = 2400;
+const SEARCH_TIMEOUT_MS = 4500;
+// Live HEAD preflight was removed from the normal critical path. The crawler's
+// own httpStatus/title/snippet signals plus extractor validation are cheaper
+// and avoid an extra network round-trip before every page.
+const PREFLIGHT_TIMEOUT_MS = 0;
+const EXTRACTION_TIMEOUT_MS = 8000;
+const JINA_FALLBACK_TIMEOUT_MS = 2200;
 
 // Do not slash the result set. Keep a healthy number of positive candidates.
-const MAX_AUTO_CANDIDATES = 32;
-const MAX_HOSTS_PER_SOURCE = 8;
+const MAX_AUTO_CANDIDATES = 40;
+const MAX_HOSTS_PER_SOURCE = 12;
 const MAX_JINA_FALLBACKS = 3;
+
+// The previous implementation launched every extraction at once. That can be
+// slower in practice when the upstream extractor/Vercel region queues or
+// throttles a burst. A bounded pool preserves all candidates while keeping
+// enough parallelism to minimize wall-clock time.
+const EXTRACTION_CONCURRENCY = 6;
 const MAX_CRAWLER_RESULTS = 40;
 const DEFAULT_COUNT = 20;
 
@@ -520,72 +529,63 @@ async function performSearch(query, count, globalSignal) {
 }
 
 async function preflightUrl(url, globalSignal) {
-    const start = Date.now();
-    const info = looksObviousBadUrl(url);
-    if (info.bad) return { ok: false, reason: info.reason, latency: Date.now() - start };
-
-    try {
-        const res = await fetchWithTimeout(info.url, {
-            method: 'HEAD',
-            redirect: 'manual',
-            headers: {
-                'Accept': 'text/html,application/xhtml+xml,application/pdf;q=0.8,*/*;q=0.1',
-                'User-Agent': 'ArixAI-Combine/3.1 (+https://lexis-ai-chatini.vercel.app/)',
-            },
-        }, PREFLIGHT_TIMEOUT_MS, globalSignal);
-
-        const status = res.status;
-        const location = res.headers.get('location') || '';
-        const contentType = (res.headers.get('content-type') || '').toLowerCase();
-
-        if ((status >= 300 && status < 400) || BLOCKED_HTTP_STATUSES.has(status)) {
-            return {
-                ok: false,
-                reason: status >= 300 && status < 400 ? 'redirect' : `blocked-${status}`,
-                status,
-                location: location.slice(0, 1000),
-                latency: Date.now() - start,
-            };
-        }
-
-        // 405/406 commonly means HEAD is unsupported. Do not punish the page.
-        if (status === 405 || status === 406) {
-            return { ok: true, soft: true, reason: 'head-not-supported', status, latency: Date.now() - start };
-        }
-
-        if (status >= 200 && status < 300) {
-            if (contentType && !/(text\/html|application\/xhtml\+xml|application\/pdf|text\/plain)/i.test(contentType)) {
-                // Unknown binary/media types are not automatically blocked. The extractor may know them.
-                return { ok: true, soft: true, reason: 'non-html-content-type', status, contentType, latency: Date.now() - start };
-            }
-            return { ok: true, status, contentType, latency: Date.now() - start };
-        }
-
-        // 4xx/5xx not in the hard list are treated as soft failures so a transient
-        // or unusual site does not get aggressively excluded.
-        if (TRANSIENT_HTTP_STATUSES.has(status)) {
-            return { ok: true, soft: true, reason: 'transient-status', status, latency: Date.now() - start };
-        }
-
-        return { ok: true, soft: true, reason: 'unclassified-http', status, latency: Date.now() - start };
-    } catch (err) {
-        // A preflight timeout is NOT a reason to discard a result. That would be
-        // over-aggressive and could reduce source count on slow sites.
-        if (err?.name === 'AbortError') {
-            return { ok: true, soft: true, reason: 'preflight-timeout', latency: Date.now() - start };
-        }
-        return { ok: true, soft: true, reason: 'preflight-error', error: String(err?.message || err), latency: Date.now() - start };
-    }
+    // Intentionally not used on the normal auto path. Kept as a compatibility
+    // helper so downstream code can still call it without breaking.
+    return {
+        ok: true,
+        soft: true,
+        skipped: true,
+        reason: 'critical-path-preflight-disabled',
+        latency: 0,
+    };
 }
 
-async function extractWithContentTacker(url, globalSignal) {
+function extractionLooksLikeBlockedOrTransportError(text) {
+    const sample = normalizeText(text, 7000).toLowerCase();
+    if (!sample) return false;
+
+    // These signatures are characteristic of upstream page-fetch failures, not
+    // ordinary article/body text. Keep the test narrow to avoid false positives.
+    if (/warning:\s*target url returned error\s+(401|403|407|429|451|5\d\d)\b/i.test(sample)) return true;
+    if (/target url returned error\s+(401|403|407|429|451)/i.test(sample)) return true;
+    if (sample.length < 5000 && /^(access denied|forbidden|unauthorized|request blocked)\s*$/.test(sample.trim())) return true;
+    if (sample.includes('checking your browser before accessing') && sample.length < 12000) return true;
+    return false;
+}
+
+function makeCombinedCancellationController(globalSignal) {
+    const controller = new AbortController();
+    let handler = null;
+    if (globalSignal) {
+        if (globalSignal.aborted) controller.abort();
+        else {
+            handler = () => controller.abort();
+            globalSignal.addEventListener('abort', handler, { once: true });
+        }
+    }
+    return {
+        controller,
+        cleanup() {
+            if (globalSignal && handler) globalSignal.removeEventListener('abort', handler);
+        },
+    };
+}
+
+async function extractWithContentTacker(url, globalSignal, cancelSignal = null) {
     const start = Date.now();
+    let localCancel = null;
+    let linkedSignal = globalSignal;
     try {
+        if (cancelSignal) {
+            localCancel = makeCombinedCancellationController(globalSignal);
+            cancelSignal.addEventListener('abort', () => localCancel.controller.abort(), { once: true });
+            linkedSignal = localCancel.controller.signal;
+        }
         const targetUrl = `${EXTRACTOR_URL}?url=${encodeURIComponent(url)}`;
         const res = await fetchWithTimeout(targetUrl, {
             method: 'GET',
             headers: { 'Accept': 'application/json' },
-        }, EXTRACTION_TIMEOUT_MS, globalSignal);
+        }, EXTRACTION_TIMEOUT_MS, linkedSignal);
 
         const parsed = await readJsonSafely(res);
         if (!res.ok) {
@@ -613,13 +613,14 @@ async function extractWithContentTacker(url, globalSignal) {
         const data = parsed.data;
         const text = normalizeText(data.text ?? data.content ?? data.markdown ?? '', 500000);
         const blocked = contentLooksBlocked(text, JSON.stringify(data.debug || ''));
+        const transportError = extractionLooksLikeBlockedOrTransportError(text);
 
-        if (!data.success || !text || blocked) {
+        if (!data.success || !text || blocked || transportError) {
             return {
                 url,
                 success: false,
                 content: text || null,
-                error: blocked ? 'Extractor returned blocked/challenge content.' : (data.error || 'No extractable content returned.'),
+                error: transportError ? 'Extractor returned an upstream blocked/error page.' : (blocked ? 'Extractor returned blocked/challenge content.' : (data.error || 'No extractable content returned.')),
                 debug: { method: 'content-tacker', ...(data.debug || {}) },
                 latency: Date.now() - start,
             };
@@ -641,6 +642,8 @@ async function extractWithContentTacker(url, globalSignal) {
             debug: { method: 'content-tacker', errors: [String(err?.message || err)] },
             latency: Date.now() - start,
         };
+    } finally {
+        if (localCancel) localCancel.cleanup();
     }
 }
 
@@ -702,7 +705,7 @@ async function extractWithJina(url, globalSignal) {
             method: 'GET',
             headers: {
                 'Accept': 'text/plain, text/markdown;q=0.9, */*;q=0.1',
-                'User-Agent': 'ArixAI-Combine/3.1',
+                'User-Agent': 'ArixAI-Combine/3.3',
             },
         }, JINA_FALLBACK_TIMEOUT_MS, globalSignal);
 
@@ -761,143 +764,144 @@ function remainingMs(startTime) {
     return TOTAL_TIMEOUT_MS - (Date.now() - startTime);
 }
 
+async function mapWithConcurrency(items, limit, worker) {
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) return [];
+
+    const results = new Array(list.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(1, limit), list.length);
+
+    async function runWorker() {
+        while (true) {
+            const index = nextIndex++;
+            if (index >= list.length) return;
+            try {
+                results[index] = await worker(list[index], index);
+            } catch (error) {
+                results[index] = {
+                    error: String(error?.message || error),
+                    item: list[index],
+                };
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    return results;
+}
+
 async function processAutoCandidates(query, searchData, globalSignal, startOverallTime) {
+    const tFilter = Date.now();
     const normalized = normalizeSearchResults(searchData);
     const selected = selectCandidates(normalized);
+    const filterDone = Date.now();
 
-    // Reuse content already extracted by the crawler when it is substantial and
-    // not obviously a challenge page. This removes an unnecessary network hop.
     const reusable = [];
     const networkEntries = [];
+
     for (const entry of selected.selected) {
         const existing = crawlerContentExtraction(entry.item);
         if (existing) reusable.push({ entry, ext: existing });
         else networkEntries.push(entry);
     }
+    const reuseDone = Date.now();
 
-    // Only candidates with no crawler HTTP status need a soft preflight. Start
-    // extraction of known-good pages immediately instead of waiting for every
-    // preflight to finish. This shortens the critical path without relaxing the
-    // crawler's relevance decisions.
-    const preflightEligible = networkEntries.filter(entry => {
-        const status = Number(entry.item.httpStatus);
-        return !Number.isFinite(status) || status <= 0;
-    });
+    // Per-request fallback budget. A failed primary extraction gets its fallback
+    // immediately, in the same worker, instead of waiting for every primary
+    // extraction to finish first. This removes a second request-wide phase.
+    let fallbackSlots = MAX_JINA_FALLBACKS;
+    let extractionStartedAt = Date.now();
 
-    const preflightPromise = (remainingMs(startOverallTime) > 2800 && preflightEligible.length)
-        ? Promise.all(preflightEligible.map(async entry => {
-            const result = await preflightUrl(entry.item.url, globalSignal);
-            return [entry.item.url, result];
-        }))
-        : Promise.resolve([]);
+    const extractionRows = await mapWithConcurrency(
+        networkEntries,
+        EXTRACTION_CONCURRENCY,
+        async (entry) => {
+            const ext = await extractWithContentTacker(entry.item.url, globalSignal);
+            let finalExt = ext;
 
-    const directEntries = networkEntries.filter(entry => {
-        const status = Number(entry.item.httpStatus);
-        return Number.isFinite(status) && status > 0;
-    });
+            if (!ext.success && fallbackSlots > 0 && remainingMs(startOverallTime) > 2600) {
+                // JavaScript executes this decrement synchronously before the await,
+                // so no two workers can consume the same fallback slot.
+                fallbackSlots--;
+                const fallback = await extractWithJina(entry.item.url, globalSignal);
+                if (fallback.success) {
+                    finalExt = {
+                        ...fallback,
+                        primaryExtractor: 'content-tacker',
+                        fallbackExtractor: 'jina-reader',
+                    };
+                } else {
+                    finalExt = {
+                        ...ext,
+                        fallback,
+                    };
+                }
+            }
 
-    // Start known-status extraction now; it runs concurrently with preflight.
-    const directExtractionPromise = Promise.all(directEntries.map(async entry => {
-        const ext = await extractWithContentTacker(entry.item.url, globalSignal);
-        return { entry, ext };
-    }));
+            return { entry, ext: finalExt, fallbackAttempted: finalExt !== ext || Boolean(finalExt?.fallback) };
+        },
+    );
+    const extractionDone = Date.now();
+    extractionStartedAt = extractionStartedAt || extractionDone;
 
-    const preflightPairs = await preflightPromise;
-    const preflightMap = new Map(preflightPairs);
-
-    const unknownEligible = preflightEligible.filter(entry => {
-        const pf = preflightMap.get(entry.item.url);
-        // A positive blocker/redirect is excluded. Timeout/network uncertainty is
-        // intentionally retained, preserving the moderate behavior.
-        return !pf || pf.ok !== false;
-    });
-
-    const unknownExtractionPromise = Promise.all(unknownEligible.map(async entry => {
-        const ext = await extractWithContentTacker(entry.item.url, globalSignal);
-        return { entry, ext };
-    }));
-
-    const [directResults, unknownResults] = await Promise.all([
-        directExtractionPromise,
-        unknownExtractionPromise,
-    ]);
-
-    const extractionResults = [
-        ...reusable,
-        ...directResults,
-        ...unknownResults,
+    const combined = [
+        ...reusable.map(({ entry, ext }) => ({
+            ...entry.item,
+            extraction: {
+                ...ext,
+                crawlerMatch: entry.label,
+                crawlerRelevanceBand: entry.item.relevanceBand ?? null,
+                crawlerRelevanceScore: entry.item.relevanceScore ?? entry.item.relevance?.score ?? null,
+                preflight: null,
+            },
+        })),
+        ...extractionRows.map(row => {
+            if (row?.entry && row?.ext) {
+                const extraction = {
+                    ...row.ext,
+                    crawlerMatch: row.entry.label,
+                    crawlerRelevanceBand: row.entry.item.relevanceBand ?? null,
+                    crawlerRelevanceScore: row.entry.item.relevanceScore ?? row.entry.item.relevance?.score ?? null,
+                    preflight: null,
+                };
+                return { ...row.entry.item, extraction };
+            }
+            const entry = row?.item;
+            return {
+                ...(entry?.item || entry || {}),
+                extraction: {
+                    url: entry?.item?.url || entry?.url || null,
+                    success: false,
+                    content: null,
+                    error: row?.error || 'Extraction worker failed.',
+                    debug: { method: 'combine-worker' },
+                    latency: 0,
+                },
+            };
+        }),
     ];
 
-    const combined = extractionResults.map(({ entry, ext }) => ({
-        ...entry.item,
-        extraction: {
-            ...ext,
-            crawlerMatch: entry.label,
-            crawlerRelevanceBand: entry.item.relevanceBand ?? null,
-            crawlerRelevanceScore: entry.item.relevanceScore ?? entry.item.relevance?.score ?? null,
-            preflight: preflightMap.get(entry.item.url) || null,
-        },
-    }));
-
-    // Limited fallback for failed primary extractions. Preserve crawler order;
-    // fallback is only for extraction resilience, never for relevance ranking.
-    let fallbackUsed = 0;
-    const fallbacksAllowed = remainingMs(startOverallTime) > 3000 ? MAX_JINA_FALLBACKS : 0;
-
-    if (fallbacksAllowed > 0) {
-        const failedIndexes = [];
-        for (let i = 0; i < combined.length && failedIndexes.length < fallbacksAllowed; i++) {
-            if (!combined[i]?.extraction?.success) failedIndexes.push(i);
-        }
-
-        const fallbackResults = await Promise.all(failedIndexes.map(async index => {
-            const item = combined[index];
-            const ext = await extractWithJina(item.url, globalSignal);
-            return { index, ext };
-        }));
-
-        for (const { index, ext } of fallbackResults) {
-            fallbackUsed++;
-            if (ext.success) {
-                combined[index].extraction = {
-                    ...ext,
-                    crawlerMatch: combined[index].matchLabel,
-                    crawlerRelevanceBand: combined[index].relevanceBand ?? null,
-                    crawlerRelevanceScore: combined[index].relevanceScore ?? combined[index].relevance?.score ?? null,
-                    preflight: preflightMap.get(combined[index].url) || null,
-                    primaryExtractor: 'content-tacker',
-                    fallbackExtractor: 'jina-reader',
-                };
-            } else {
-                combined[index].extraction.fallback = ext;
-            }
-        }
-    }
-
-    // IMPORTANT: `rank` is now assigned only after extraction succeeds. This
-    // makes JSON rank exactly match the frontend's displayed 1..N source order.
-    // Failed pages are removed from `results`; diagnostics are kept separately.
+    // `rank` is assigned only after successful extraction, so JSON and frontend
+    // source positions stay identical even after filtering/failures.
     const successful = [];
     const failedResults = [];
+
     for (const item of combined) {
         delete item._originalRank;
-        if (item.extraction?.success) {
-            successful.push(item);
-        } else {
-            // Failed pages are diagnostics only and must never carry a display rank.
+        if (item.extraction?.success) successful.push(item);
+        else {
             delete item.rank;
             failedResults.push(item);
         }
     }
 
     successful.sort((a, b) => {
-        const ar = Number(a.rank) || 999999;
-        const br = Number(b.rank) || 999999;
+        const ar = Number(a.crawlerRank ?? a.rank) || 999999;
+        const br = Number(b.crawlerRank ?? b.rank) || 999999;
         return ar - br;
     });
-    for (let i = 0; i < successful.length; i++) {
-        successful[i].rank = i + 1;
-    }
+    for (let i = 0; i < successful.length; i++) successful[i].rank = i + 1;
 
     return {
         results: successful,
@@ -905,14 +909,21 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         stats: {
             ...selected.stats,
             crawlerContentReused: reusable.length,
-            preflightChecked: preflightEligible.length,
-            preflightRejected: [...preflightMap.values()].filter(v => v && v.ok === false).length,
-            extractionSent: directEntries.length + unknownEligible.length,
+            preflightChecked: 0,
+            preflightRejected: 0,
+            extractionSent: networkEntries.length,
             extractionSucceeded: successful.length,
             extractionFailed: failedResults.length,
-            fallbackAttempts: fallbackUsed,
+            fallbackAttempts: MAX_JINA_FALLBACKS - fallbackSlots,
             failedExtractions: failedResults.length,
             normalizedSources: normalized.length,
+            extractionConcurrency: EXTRACTION_CONCURRENCY,
+            preflightCriticalPathRemoved: true,
+            timings_ms: {
+                candidate_filter: filterDone - tFilter,
+                crawler_content_reuse_check: reuseDone - filterDone,
+                extraction_and_inline_fallback: extractionDone - extractionStartedAt,
+            },
         },
     };
 }
@@ -930,29 +941,17 @@ async function processDirectExtraction(urls, globalSignal, startOverallTime) {
         unique.push(info.url);
     }
 
-    const results = await Promise.all(unique.map(async url => {
+    let fallbackSlots = MAX_JINA_FALLBACKS;
+    return mapWithConcurrency(unique, EXTRACTION_CONCURRENCY, async (url) => {
         const ext = await extractWithContentTacker(url, globalSignal);
+        if (!ext.success && fallbackSlots > 0 && remainingMs(startOverallTime) > 2800) {
+            fallbackSlots--;
+            const fallback = await extractWithJina(url, globalSignal);
+            if (fallback.success) return { url, extraction: fallback };
+            ext.fallback = fallback;
+        }
         return { url, extraction: ext };
-    }));
-
-    // Same limited fallback behavior for direct extraction, kept parallel so
-    // one slow fallback does not serialize the rest of the request.
-    if (remainingMs(startOverallTime) > 4000 && results.length) {
-        const indexes = [];
-        for (let i = 0; i < results.length && indexes.length < MAX_JINA_FALLBACKS; i++) {
-            if (!results[i].extraction?.success) indexes.push(i);
-        }
-        const fallbackResults = await Promise.all(indexes.map(async index => ({
-            index,
-            fallback: await extractWithJina(results[index].url, globalSignal),
-        })));
-        for (const { index, fallback } of fallbackResults) {
-            results[index].extraction.fallback = fallback;
-            if (fallback.success) results[index].extraction = fallback;
-        }
-    }
-
-    return results;
+    });
 }
 
 export default async function handler(req) {
@@ -991,11 +990,14 @@ export default async function handler(req) {
             failed_extractions: 0,
             total_time_ms: 0,
         };
+        const handlerStart = startOverallTime;
 
         if (action === 'search' || action === 'auto') {
             if (!query) throw new Error("Missing 'query' parameter. Please pass ?query=YOUR_SEARCH in the URL.");
 
+            const searchStarted = Date.now();
             const searchData = await performSearch(String(query), count, controller.signal);
+            const searchFinished = Date.now();
             const normalized = normalizeSearchResults(searchData);
 
             if (action === 'search') {
@@ -1018,6 +1020,12 @@ export default async function handler(req) {
                 finalPayload.failed_results = processed.failedResults;
                 finalPayload.failed_extractions = processed.stats.failedExtractions;
                 finalPayload.filter_stats = processed.stats;
+                finalPayload.timings_ms = {
+                    crawler_search: searchFinished - searchStarted,
+                    candidate_filter_and_reuse: (processed.stats.timings_ms?.candidate_filter || 0) + (processed.stats.timings_ms?.crawler_content_reuse_check || 0),
+                    extraction_and_fallback: processed.stats.timings_ms?.extraction_and_inline_fallback || 0,
+                    total: Date.now() - handlerStart,
+                };
                 finalPayload.crawler = {
                     version: searchData.version ?? null,
                     requestedResults: searchData.requestedResults ?? count,
@@ -1038,6 +1046,11 @@ export default async function handler(req) {
 
         clearTimeout(globalTimeoutId);
         finalPayload.total_time_ms = Date.now() - startOverallTime;
+        if (!finalPayload.timings_ms) {
+            finalPayload.timings_ms = { total: finalPayload.total_time_ms };
+        } else {
+            finalPayload.timings_ms.total = finalPayload.total_time_ms;
+        }
         return jsonResponse(finalPayload, 200);
     } catch (err) {
         clearTimeout(globalTimeoutId);
