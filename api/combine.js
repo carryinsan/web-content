@@ -20,7 +20,7 @@ const TOTAL_TIMEOUT_MS = 14500;
 // Phase budgets aggressively tuned for fail-fast behavior
 const SEARCH_TIMEOUT_MS = 4500;
 const PREFLIGHT_TIMEOUT_MS = 0;
-const EXTRACTION_TIMEOUT_MS = 4800; // Drastically reduced from 8000ms to prevent bottlenecking
+const EXTRACTION_TIMEOUT_MS = 7800; // Drastically reduced from 8000ms to prevent bottlenecking
 const JINA_FALLBACK_TIMEOUT_MS = 1800; // Reduced from 2200ms
 
 // Strict candidate limits to prevent network saturation
@@ -29,7 +29,7 @@ const MAX_HOSTS_PER_SOURCE = 2; // Reduced from 12. Forces diversity, prevents o
 const MAX_JINA_FALLBACKS = 3;
 
 // Massive concurrency boost. We blast out requests simultaneously.
-const EXTRACTION_CONCURRENCY = 15; // Increased from 6
+const EXTRACTION_CONCURRENCY = 25; // Increased from 6
 const MAX_CRAWLER_RESULTS = 40;
 const DEFAULT_COUNT = 20;
 
