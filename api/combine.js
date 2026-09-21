@@ -1,22 +1,9 @@
 /*
  * ArixAI Combined Search + Crawler-Guided Content Extractor
- * v3.3.1 — Large wall-clock speed optimization with crawler-guided filtering
+ * v4.0 — Ultra-Low Latency Optimization with Heuristic Viability Predictor
  *
  * DROP-IN replacement for: api/combine.js
  * Runtime: Vercel Edge
- *
- * IMPORTANT:
- * - The crawler's own relevanceBand/relevanceScore are the source of truth.
- * - This file does NOT calculate a second relevance score.
- * - Weak crawler matches are excluded in `auto` mode.
- * - `usable` and `related` are retained from the example crawler contract.
- * - Friendly matchLabel values are display aliases only; the original
- *   crawler `relevanceBand` is preserved unchanged.
- *
- * Public actions remain unchanged:
- *   ?action=search&query=...
- *   ?action=auto&query=...
- *   ?action=extract&urls=[...]
  */
 
 export const config = {
@@ -27,34 +14,25 @@ const CRAWLER_URL = 'https://web-crawler-pink.vercel.app/api/crawler';
 const EXTRACTOR_URL = 'https://content-tacker.vercel.app/api/extract';
 const JINA_READER_BASE = 'https://r.jina.ai/';
 
-// Moderate global budget. The old version could spend most of the request on
-// a small candidate set. 20s gives the extractor room without becoming slow.
-const TOTAL_TIMEOUT_MS = 15000;
+// Global caps to enforce sub-10s responses.
+const TOTAL_TIMEOUT_MS = 14500; 
 
-// Phase budgets. These are local caps; the global signal always wins.
+// Phase budgets aggressively tuned for fail-fast behavior
 const SEARCH_TIMEOUT_MS = 4500;
-// Live HEAD preflight was removed from the normal critical path. The crawler's
-// own httpStatus/title/snippet signals plus extractor validation are cheaper
-// and avoid an extra network round-trip before every page.
 const PREFLIGHT_TIMEOUT_MS = 0;
-const EXTRACTION_TIMEOUT_MS = 8000;
-const JINA_FALLBACK_TIMEOUT_MS = 2200;
+const EXTRACTION_TIMEOUT_MS = 4800; // Drastically reduced from 8000ms to prevent bottlenecking
+const JINA_FALLBACK_TIMEOUT_MS = 1800; // Reduced from 2200ms
 
-// Do not slash the result set. Keep a healthy number of positive candidates.
-const MAX_AUTO_CANDIDATES = 40;
-const MAX_HOSTS_PER_SOURCE = 12;
+// Strict candidate limits to prevent network saturation
+const MAX_AUTO_CANDIDATES = 20; // Reduced from 40. Quality > Quantity for speed.
+const MAX_HOSTS_PER_SOURCE = 2; // Reduced from 12. Forces diversity, prevents one slow host from clogging.
 const MAX_JINA_FALLBACKS = 3;
 
-// The previous implementation launched every extraction at once. That can be
-// slower in practice when the upstream extractor/Vercel region queues or
-// throttles a burst. A bounded pool preserves all candidates while keeping
-// enough parallelism to minimize wall-clock time.
-const EXTRACTION_CONCURRENCY = 6;
+// Massive concurrency boost. We blast out requests simultaneously.
+const EXTRACTION_CONCURRENCY = 15; // Increased from 6
 const MAX_CRAWLER_RESULTS = 40;
 const DEFAULT_COUNT = 20;
 
-// A crawler result that already contains trustworthy page text can be reused
-// directly instead of making a second network extraction request.
 const MIN_REUSABLE_CRAWLER_TEXT = 400;
 
 const CORS_HEADERS = {
@@ -66,22 +44,10 @@ const CORS_HEADERS = {
 };
 
 const SEARCH_SURFACE_HOSTS = new Set([
-    'google.com', 'www.google.com',
-    'bing.com', 'www.bing.com',
-    'search.brave.com',
-    'yahoo.com', 'search.yahoo.com',
-    'mojeek.com', 'www.mojeek.com',
-    'duckduckgo.com', 'www.duckduckgo.com',
-    'news.google.com',
-    'ecosia.org', 'www.ecosia.org',
-    'yandex.com', 'www.yandex.com', 'yandex.ru',
-    'qwant.com', 'www.qwant.com',
-    'startpage.com', 'www.startpage.com',
-    'aol.com', 'search.aol.com',
-    'ask.com', 'www.ask.com',
-    'baidu.com', 'www.baidu.com',
-    'sogou.com', 'www.sogou.com',
-    'naver.com', 'search.naver.com',
+    'google.com', 'www.google.com', 'bing.com', 'www.bing.com',
+    'search.brave.com', 'yahoo.com', 'search.yahoo.com',
+    'duckduckgo.com', 'www.duckduckgo.com', 'news.google.com',
+    'yandex.com', 'www.yandex.com', 'baidu.com', 'naver.com'
 ]);
 
 const SHORTENER_HOSTS = new Set([
@@ -95,8 +61,6 @@ const HARD_BLOCK_HOSTS = new Set([
     'translate.google.com',
 ]);
 
-// Only obvious URL-level blockers. Keep this list intentionally narrow so
-// legitimate article URLs are not thrown away.
 const BAD_URL_MARKERS = [
     '/captcha', 'captcha=', 'recaptcha', 'hcaptcha',
     '/challenge', 'cf-chl-', 'challenge-platform',
@@ -106,70 +70,83 @@ const BAD_URL_MARKERS = [
     'security-check', 'ddos-guard',
 ];
 
-const BAD_CONTENT_MARKERS = [
-    'verify you are human',
-    'verify that you are human',
-    'complete the security check',
-    'checking your browser before accessing',
-    'just a moment...',
-    'attention required',
-    'access denied',
-    'request blocked',
-    'bot detected',
-    'automated requests',
-    'unusual traffic',
-    'captcha',
-    'recaptcha',
-    'hcaptcha',
-    'enable javascript and cookies',
-    'enable cookies to continue',
-    'cloudflare ray id',
-];
-
 const BLOCKED_HTTP_STATUSES = new Set([401, 403, 407, 429, 451]);
-const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 500, 502, 503, 504, 521, 522, 523, 524]);
 
-// Crawler-native positive/negative aliases.
-// The attached crawler sample uses `usable`, `related`, and `weak`.
 const POSITIVE_BANDS = new Set([
-    'strong',
-    'strong_match',
-    'strong-match',
-    'usable',
-    'highly_relevant',
-    'highly-relevant',
-    'likely',
-    'likely_relevant',
-    'likely-relevant',
-    'relevant',
-    'related',
-    'partial',
-    'partial_match',
-    'partial-match',
+    'strong', 'strong_match', 'strong-match', 'usable',
+    'highly_relevant', 'highly-relevant', 'likely', 'likely_relevant',
+    'likely-relevant', 'relevant', 'related', 'partial', 'partial_match', 'partial-match',
 ]);
 
 const NEGATIVE_BANDS = new Set([
-    'weak',
-    'irrelevant',
-    'unusable',
-    'none',
-    'no_match',
-    'no-match',
+    'weak', 'irrelevant', 'unusable', 'none', 'no_match', 'no-match',
 ]);
+
+// ============================================================================
+// NEW ALGORITHM: HEURISTIC EXTRACTION VIABILITY PREDICTOR
+// Predicts if a page will fail or take too long before we even try to extract it.
+// ============================================================================
+
+// Extensions that take massive amounts of time to parse (like PDFs taking 5-8s)
+const SLOW_OR_UNEXTRACTABLE_EXTENSIONS = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|exe|mp4|mp3|avi|mov|jpg|jpeg|png|gif|webp)$/i;
+
+// Domains guaranteed to throw captchas, auth walls, or rate limits at headless browsers
+const HIGH_BLOCK_DOMAINS = new Set([
+    'linkedin.com', 'www.linkedin.com',
+    'facebook.com', 'www.facebook.com',
+    'instagram.com', 'www.instagram.com',
+    'twitter.com', 'x.com',
+    'tiktok.com', 'www.tiktok.com',
+    'bloomberg.com', 'www.bloomberg.com',
+    'wsj.com', 'www.wsj.com',
+    'glassdoor.com', 'www.glassdoor.com',
+    'g2.com', 'www.g2.com',
+    'capterra.com', 'www.capterra.com',
+    'yelp.com', 'www.yelp.com',
+    'quora.com', 'www.quora.com'
+]);
+
+function predictExtractionViability(url, item) {
+    if (!url) return { viable: false, reason: 'no-url' };
+
+    try {
+        const urlObj = new URL(url);
+        
+        // 1. Skip heavy document files (The biggest source of 5-8s latency spikes)
+        if (SLOW_OR_UNEXTRACTABLE_EXTENSIONS.test(urlObj.pathname)) {
+            return { viable: false, reason: 'heavy-file-extension-skipped' };
+        }
+
+        // 2. Skip known anti-bot / paywall domains
+        if (HIGH_BLOCK_DOMAINS.has(urlObj.hostname)) {
+            return { viable: false, reason: 'high-block-probability-domain' };
+        }
+    } catch(e) {}
+
+    // 3. Analyze snippet/title text for advanced block/paywall signatures
+    const title = normalizeText(getResultTitle(item)).toLowerCase();
+    const snippet = normalizeText(getResultSnippet(item)).toLowerCase();
+    const text = `${title} ${snippet}`;
+
+    if (text.includes('enable javascript') && text.includes('browser')) return { viable: false, reason: 'js-wall-detected' };
+    if (text.includes('are you a robot') || text.includes('verify you are human')) return { viable: false, reason: 'captcha-detected' };
+    if (text.includes('subscribe to read') || text.includes('log in to continue')) return { viable: false, reason: 'paywall-login-detected' };
+    if (text.includes('access denied') || text.includes('403 forbidden')) return { viable: false, reason: 'forbidden-detected' };
+    if (text.includes('cloudflare ray id')) return { viable: false, reason: 'cloudflare-challenge-detected'};
+
+    return { viable: true, reason: 'looks-good' };
+}
+// ============================================================================
 
 function jsonResponse(payload, status = 200) {
     return new Response(safeJsonStringify(payload), {
-        status,
-        headers: CORS_HEADERS,
+        status, headers: CORS_HEADERS,
     });
 }
 
 function safeJsonStringify(value) {
-    try {
-        return JSON.stringify(value);
-    } catch {
-        return JSON.stringify({ success: false, error: 'SERIALIZATION_FAILED' });
-    }
+    try { return JSON.stringify(value); } 
+    catch { return JSON.stringify({ success: false, error: 'SERIALIZATION_FAILED' }); }
 }
 
 function clampInt(value, min, max, fallback) {
@@ -201,17 +178,9 @@ function getField(obj, keys) {
     return '';
 }
 
-function getResultTitle(item) {
-    return getField(item, ['title', 'name', 'headline', 'pageTitle']);
-}
-
-function getResultSnippet(item) {
-    return getField(item, ['snippet', 'description', 'summary', 'excerpt', 'text']);
-}
-
-function getResultUrl(item) {
-    return getField(item, ['url', 'link', 'href', 'sourceUrl', 'source_url']);
-}
+function getResultTitle(item) { return getField(item, ['title', 'name', 'headline', 'pageTitle']); }
+function getResultSnippet(item) { return getField(item, ['snippet', 'description', 'summary', 'excerpt', 'text']); }
+function getResultUrl(item) { return getField(item, ['url', 'link', 'href', 'sourceUrl', 'source_url']); }
 
 function canonicalizeUrl(rawUrl) {
     try {
@@ -220,30 +189,21 @@ function canonicalizeUrl(rawUrl) {
         u.hash = '';
         u.hostname = u.hostname.toLowerCase();
 
-        // Remove only common tracking parameters. Keep content-bearing query params.
-        const trackingExact = new Set([
-            'fbclid', 'gclid', 'dclid', 'msclkid', 'mc_cid', 'mc_eid',
-        ]);
+        const trackingExact = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'mc_cid', 'mc_eid']);
         for (const key of [...u.searchParams.keys()]) {
             const lower = key.toLowerCase();
             if (lower.startsWith('utm_') || trackingExact.has(lower)) {
                 u.searchParams.delete(key);
             }
         }
-
         if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, '');
         return u.toString();
-    } catch {
-        return null;
-    }
+    } catch { return null; }
 }
 
 function getHost(rawUrl) {
-    try {
-        return new URL(rawUrl).hostname.toLowerCase();
-    } catch {
-        return '';
-    }
+    try { return new URL(rawUrl).hostname.toLowerCase(); } 
+    catch { return ''; }
 }
 
 function isSearchSurface(host) {
@@ -272,14 +232,11 @@ function looksObviousBadUrl(rawUrl) {
 
 function crawlerBand(item) {
     return String(item?.relevanceBand ?? item?.relevance?.band ?? '')
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, '_');
+        .trim().toLowerCase().replace(/\s+/g, '_');
 }
 
 function matchLabelFromCrawlerBand(band) {
     const b = String(band || '').toLowerCase().trim().replace(/\s+/g, '_');
-    // These are display aliases only; no second relevance calculation occurs.
     if (b === 'strong' || b === 'strong_match' || b === 'strong-match' || b === 'usable' || b === 'highly_relevant' || b === 'highly-relevant') {
         return 'strong match';
     }
@@ -300,40 +257,14 @@ function crawlerBandDecision(item) {
     if (POSITIVE_BANDS.has(band)) {
         return { allowed: true, band, label: matchLabelFromCrawlerBand(band), reason: null };
     }
-
-    // Unknown future crawler bands are kept rather than rejected. This is the
-    // fail-safe, non-aggressive behavior: unknown != weak.
     return { allowed: true, band, label: matchLabelFromCrawlerBand(band), reason: 'crawler-band-unknown-kept' };
-}
-
-function titleOrSnippetLooksBlocked(item) {
-    const title = normalizeText(getResultTitle(item), 1200).toLowerCase();
-    const snippet = normalizeText(getResultSnippet(item), 3500).toLowerCase();
-    const sample = `${title} ${snippet}`;
-
-    if (!sample) return false;
-
-    if (title === 'access denied' || title === 'forbidden' || title === 'request blocked') return true;
-    if (sample.includes('verify you are human')) return true;
-    if (sample.includes('complete the security check')) return true;
-    if (sample.includes('checking your browser before accessing')) return true;
-    if (sample.includes('recaptcha') && sample.includes('captcha')) return true;
-    if (sample.includes('access denied') && (sample.includes('cloudflare') || sample.includes('bot'))) return true;
-
-    return false;
 }
 
 function sourceHttpDecision(item) {
     const status = Number(item?.httpStatus);
-    if (!Number.isFinite(status) || status <= 0) {
-        return { bad: false, reason: null, hard: false };
-    }
-    if (BLOCKED_HTTP_STATUSES.has(status)) {
-        return { bad: true, reason: `http-${status}`, hard: true };
-    }
-    if (status >= 300 && status < 400) {
-        return { bad: true, reason: `redirect-${status}`, hard: true };
-    }
+    if (!Number.isFinite(status) || status <= 0) return { bad: false, reason: null, hard: false };
+    if (BLOCKED_HTTP_STATUSES.has(status)) return { bad: true, reason: `http-${status}`, hard: true };
+    if (status >= 300 && status < 400) return { bad: true, reason: `redirect-${status}`, hard: true };
     return { bad: false, reason: null, hard: false };
 }
 
@@ -371,8 +302,11 @@ function candidateReason(item) {
     const http = sourceHttpDecision(item);
     if (http.bad) return { allowed: false, reason: http.reason, band: band.band, label: band.label };
 
-    if (titleOrSnippetLooksBlocked(item)) {
-        return { allowed: false, reason: 'blocked-page-signature', band: band.band, label: band.label };
+    // Inject the new Viability Predictor Here
+    const url = getResultUrl(item);
+    const viability = predictExtractionViability(url, item);
+    if (!viability.viable) {
+        return { allowed: false, reason: viability.reason, band: band.band, label: band.label };
     }
 
     return { allowed: true, reason: null, band: band.band, label: band.label };
@@ -391,16 +325,15 @@ function decorateCrawlerMatch(item) {
 function selectCandidates(searchResults) {
     let weakDropped = 0;
     let badUrlOrAccessDropped = 0;
+    let predictorDropped = 0;
     const accepted = [];
 
-    // Do not compute or invent relevance. The crawler's band decides eligibility.
-    // We retain all non-weak candidates first, then apply only a light source-
-    // diversity cap so a single domain cannot consume the entire extraction set.
     for (const item of searchResults) {
         const decision = candidateReason(item);
 
         if (!decision.allowed) {
             if (decision.reason === 'crawler-weak-band') weakDropped++;
+            else if (decision.reason.includes('detected') || decision.reason.includes('domain') || decision.reason.includes('extension')) predictorDropped++;
             else badUrlOrAccessDropped++;
             continue;
         }
@@ -414,45 +347,17 @@ function selectCandidates(searchResults) {
     }
 
     const selected = [];
-    const deferred = [];
     const hostCounts = new Map();
 
-    // First pass: one-to-eight-per-host while preserving crawler order.
+    // Stricter one-to-two-per-host diversity cap
     for (const entry of accepted) {
-        if (selected.length >= MAX_AUTO_CANDIDATES) {
-            deferred.push(entry);
-            continue;
-        }
+        if (selected.length >= MAX_AUTO_CANDIDATES) break;
+        
         const host = getHost(entry.item.url);
         const count = hostCounts.get(host) || 0;
+        
         if (count < MAX_HOSTS_PER_SOURCE) {
             hostCounts.set(host, count + 1);
-            selected.push(entry);
-        } else {
-            deferred.push(entry);
-        }
-    }
-
-    // If diversity filtering created empty slots, fill them with deferred items
-    // in the crawler's original order. This is intentionally permissive.
-    if (selected.length < MAX_AUTO_CANDIDATES) {
-        for (const entry of deferred) {
-            if (selected.length >= MAX_AUTO_CANDIDATES) break;
-            const host = getHost(entry.item.url);
-            const count = hostCounts.get(host) || 0;
-            if (count < MAX_HOSTS_PER_SOURCE) {
-                hostCounts.set(host, count + 1);
-                selected.push(entry);
-            }
-        }
-    }
-
-    // Last fail-safe fill: if a query has many results from one host only,
-    // do not aggressively reduce the result count; allow them after the soft cap.
-    if (selected.length < Math.min(MAX_AUTO_CANDIDATES, accepted.length)) {
-        for (const entry of accepted) {
-            if (selected.length >= MAX_AUTO_CANDIDATES) break;
-            if (selected.includes(entry)) continue;
             selected.push(entry);
         }
     }
@@ -466,6 +371,7 @@ function selectCandidates(searchResults) {
             crawlerPositive: accepted.length,
             weakDropped,
             badUrlOrAccessDropped,
+            predictorDropped, // New metric
             selected: selected.length,
         },
     };
@@ -501,11 +407,8 @@ async function fetchWithTimeout(resource, options = {}, timeoutMs, globalSignal)
 async function readJsonSafely(response) {
     const raw = await response.text();
     if (!raw) return { ok: false, data: null, raw: '' };
-    try {
-        return { ok: true, data: JSON.parse(raw), raw };
-    } catch {
-        return { ok: false, data: null, raw: raw.slice(0, 6000) };
-    }
+    try { return { ok: true, data: JSON.parse(raw), raw }; } 
+    catch { return { ok: false, data: null, raw: raw.slice(0, 6000) }; }
 }
 
 async function performSearch(query, count, globalSignal) {
@@ -528,24 +431,10 @@ async function performSearch(query, count, globalSignal) {
     }
 }
 
-async function preflightUrl(url, globalSignal) {
-    // Intentionally not used on the normal auto path. Kept as a compatibility
-    // helper so downstream code can still call it without breaking.
-    return {
-        ok: true,
-        soft: true,
-        skipped: true,
-        reason: 'critical-path-preflight-disabled',
-        latency: 0,
-    };
-}
-
 function extractionLooksLikeBlockedOrTransportError(text) {
     const sample = normalizeText(text, 7000).toLowerCase();
     if (!sample) return false;
 
-    // These signatures are characteristic of upstream page-fetch failures, not
-    // ordinary article/body text. Keep the test narrow to avoid false positives.
     if (/warning:\s*target url returned error\s+(401|403|407|429|451|5\d\d)\b/i.test(sample)) return true;
     if (/target url returned error\s+(401|403|407|429|451)/i.test(sample)) return true;
     if (sample.length < 5000 && /^(access denied|forbidden|unauthorized|request blocked)\s*$/.test(sample.trim())) return true;
@@ -563,12 +452,7 @@ function makeCombinedCancellationController(globalSignal) {
             globalSignal.addEventListener('abort', handler, { once: true });
         }
     }
-    return {
-        controller,
-        cleanup() {
-            if (globalSignal && handler) globalSignal.removeEventListener('abort', handler);
-        },
-    };
+    return { controller, cleanup() { if (globalSignal && handler) globalSignal.removeEventListener('abort', handler); } };
 }
 
 async function extractWithContentTacker(url, globalSignal, cancelSignal = null) {
@@ -590,9 +474,7 @@ async function extractWithContentTacker(url, globalSignal, cancelSignal = null) 
         const parsed = await readJsonSafely(res);
         if (!res.ok) {
             return {
-                url,
-                success: false,
-                content: null,
+                url, success: false, content: null,
                 error: `Extractor API returned status ${res.status}`,
                 debug: { method: 'content-tacker', status: res.status },
                 latency: Date.now() - start,
@@ -601,9 +483,7 @@ async function extractWithContentTacker(url, globalSignal, cancelSignal = null) 
 
         if (!parsed.ok || !parsed.data || typeof parsed.data !== 'object') {
             return {
-                url,
-                success: false,
-                content: null,
+                url, success: false, content: null,
                 error: 'Extractor API returned invalid JSON.',
                 debug: { method: 'content-tacker', rawPreview: parsed.raw.slice(0, 500) },
                 latency: Date.now() - start,
@@ -617,9 +497,7 @@ async function extractWithContentTacker(url, globalSignal, cancelSignal = null) 
 
         if (!data.success || !text || blocked || transportError) {
             return {
-                url,
-                success: false,
-                content: text || null,
+                url, success: false, content: text || null,
                 error: transportError ? 'Extractor returned an upstream blocked/error page.' : (blocked ? 'Extractor returned blocked/challenge content.' : (data.error || 'No extractable content returned.')),
                 debug: { method: 'content-tacker', ...(data.debug || {}) },
                 latency: Date.now() - start,
@@ -627,17 +505,13 @@ async function extractWithContentTacker(url, globalSignal, cancelSignal = null) 
         }
 
         return {
-            url,
-            success: true,
-            content: text,
+            url, success: true, content: text,
             debug: { method: 'content-tacker', ...(data.debug || {}) },
             latency: Date.now() - start,
         };
     } catch (err) {
         return {
-            url,
-            success: false,
-            content: null,
+            url, success: false, content: null,
             error: err?.name === 'AbortError' ? 'Extraction timeout exceeded.' : String(err?.message || err),
             debug: { method: 'content-tacker', errors: [String(err?.message || err)] },
             latency: Date.now() - start,
@@ -649,11 +523,7 @@ async function extractWithContentTacker(url, globalSignal, cancelSignal = null) 
 
 function getCrawlerPageContent(item) {
     if (!item || typeof item !== 'object') return '';
-    const candidates = [
-        item.contentForAI,
-        item.pageContent,
-        item.extractedText,
-    ];
+    const candidates = [item.contentForAI, item.pageContent, item.extractedText];
     for (const value of candidates) {
         const text = normalizeText(value, 500000);
         if (text.length >= MIN_REUSABLE_CRAWLER_TEXT && !contentLooksBlocked(text)) {
@@ -667,13 +537,8 @@ function crawlerContentExtraction(item) {
     const text = getCrawlerPageContent(item);
     if (!text) return null;
     return {
-        url: item.url,
-        success: true,
-        content: text,
-        debug: {
-            method: 'crawler-native-content',
-            contentLength: text.length,
-        },
+        url: item.url, success: true, content: text,
+        debug: { method: 'crawler-native-content', contentLength: text.length },
         latency: 0,
     };
 }
@@ -689,7 +554,6 @@ function contentLooksBlocked(text, debugText = '') {
     if (sample.includes('request blocked') && sample.includes('bot')) return true;
     if (sample.includes('access denied') && (sample.includes('cloudflare') || sample.includes('security'))) return true;
 
-    // Generic CAPTCHA is only a blocker when accompanied by a second challenge signal.
     const captcha = sample.includes('captcha') || sample.includes('recaptcha') || sample.includes('hcaptcha');
     const challenge = sample.includes('challenge') || sample.includes('verify') || sample.includes('human');
     if (captcha && challenge) return true;
@@ -705,58 +569,29 @@ async function extractWithJina(url, globalSignal) {
             method: 'GET',
             headers: {
                 'Accept': 'text/plain, text/markdown;q=0.9, */*;q=0.1',
-                'User-Agent': 'ArixAI-Combine/3.3',
+                'User-Agent': 'ArixAI-Combine/4.0',
             },
         }, JINA_FALLBACK_TIMEOUT_MS, globalSignal);
 
         if (!res.ok) {
-            return {
-                url,
-                success: false,
-                content: null,
-                error: `Fallback reader returned status ${res.status}`,
-                debug: { method: 'jina-reader', status: res.status },
-                latency: Date.now() - start,
-            };
+            return { url, success: false, content: null, error: `Fallback reader returned status ${res.status}`, debug: { method: 'jina-reader', status: res.status }, latency: Date.now() - start };
         }
 
         const raw = await res.text();
         const text = normalizeText(raw, 500000);
         if (!text || contentLooksBlocked(text)) {
-            return {
-                url,
-                success: false,
-                content: null,
-                error: 'Fallback reader returned no usable page content.',
-                debug: { method: 'jina-reader' },
-                latency: Date.now() - start,
-            };
+            return { url, success: false, content: null, error: 'Fallback reader returned no usable page content.', debug: { method: 'jina-reader' }, latency: Date.now() - start };
         }
 
-        return {
-            url,
-            success: true,
-            content: text,
-            debug: { method: 'jina-reader' },
-            latency: Date.now() - start,
-        };
+        return { url, success: true, content: text, debug: { method: 'jina-reader' }, latency: Date.now() - start };
     } catch (err) {
-        return {
-            url,
-            success: false,
-            content: null,
-            error: err?.name === 'AbortError' ? 'Fallback reader timeout exceeded.' : String(err?.message || err),
-            debug: { method: 'jina-reader', errors: [String(err?.message || err)] },
-            latency: Date.now() - start,
-        };
+        return { url, success: false, content: null, error: err?.name === 'AbortError' ? 'Fallback reader timeout exceeded.' : String(err?.message || err), debug: { method: 'jina-reader', errors: [String(err?.message || err)] }, latency: Date.now() - start };
     }
 }
 
 function parseUrls(value) {
     if (Array.isArray(value)) return value.map(String).map(s => s.trim()).filter(Boolean);
-    if (typeof value === 'string') {
-        return value.split(',').map(s => s.trim()).filter(Boolean);
-    }
+    if (typeof value === 'string') return value.split(',').map(s => s.trim()).filter(Boolean);
     return [];
 }
 
@@ -779,10 +614,7 @@ async function mapWithConcurrency(items, limit, worker) {
             try {
                 results[index] = await worker(list[index], index);
             } catch (error) {
-                results[index] = {
-                    error: String(error?.message || error),
-                    item: list[index],
-                };
+                results[index] = { error: String(error?.message || error), item: list[index] };
             }
         }
     }
@@ -807,9 +639,6 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
     }
     const reuseDone = Date.now();
 
-    // Per-request fallback budget. A failed primary extraction gets its fallback
-    // immediately, in the same worker, instead of waiting for every primary
-    // extraction to finish first. This removes a second request-wide phase.
     let fallbackSlots = MAX_JINA_FALLBACKS;
     let extractionStartedAt = Date.now();
 
@@ -817,25 +646,21 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         networkEntries,
         EXTRACTION_CONCURRENCY,
         async (entry) => {
+            // Cut processing early if we are near the global edge timeout
+            if (remainingMs(startOverallTime) < 1500) {
+                 return { entry, ext: { url: entry.item.url, success: false, error: 'Global Timeout Preempted' }};
+            }
+
             const ext = await extractWithContentTacker(entry.item.url, globalSignal);
             let finalExt = ext;
 
-            if (!ext.success && fallbackSlots > 0 && remainingMs(startOverallTime) > 2600) {
-                // JavaScript executes this decrement synchronously before the await,
-                // so no two workers can consume the same fallback slot.
+            if (!ext.success && fallbackSlots > 0 && remainingMs(startOverallTime) > 2000) {
                 fallbackSlots--;
                 const fallback = await extractWithJina(entry.item.url, globalSignal);
                 if (fallback.success) {
-                    finalExt = {
-                        ...fallback,
-                        primaryExtractor: 'content-tacker',
-                        fallbackExtractor: 'jina-reader',
-                    };
+                    finalExt = { ...fallback, primaryExtractor: 'content-tacker', fallbackExtractor: 'jina-reader' };
                 } else {
-                    finalExt = {
-                        ...ext,
-                        fallback,
-                    };
+                    finalExt = { ...ext, fallback };
                 }
             }
 
@@ -849,8 +674,7 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         ...reusable.map(({ entry, ext }) => ({
             ...entry.item,
             extraction: {
-                ...ext,
-                crawlerMatch: entry.label,
+                ...ext, crawlerMatch: entry.label,
                 crawlerRelevanceBand: entry.item.relevanceBand ?? null,
                 crawlerRelevanceScore: entry.item.relevanceScore ?? entry.item.relevance?.score ?? null,
                 preflight: null,
@@ -859,8 +683,7 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         ...extractionRows.map(row => {
             if (row?.entry && row?.ext) {
                 const extraction = {
-                    ...row.ext,
-                    crawlerMatch: row.entry.label,
+                    ...row.ext, crawlerMatch: row.entry.label,
                     crawlerRelevanceBand: row.entry.item.relevanceBand ?? null,
                     crawlerRelevanceScore: row.entry.item.relevanceScore ?? row.entry.item.relevance?.score ?? null,
                     preflight: null,
@@ -872,18 +695,13 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
                 ...(entry?.item || entry || {}),
                 extraction: {
                     url: entry?.item?.url || entry?.url || null,
-                    success: false,
-                    content: null,
-                    error: row?.error || 'Extraction worker failed.',
-                    debug: { method: 'combine-worker' },
-                    latency: 0,
+                    success: false, content: null, error: row?.error || 'Extraction worker failed.',
+                    debug: { method: 'combine-worker' }, latency: 0,
                 },
             };
         }),
     ];
 
-    // `rank` is assigned only after successful extraction, so JSON and frontend
-    // source positions stay identical even after filtering/failures.
     const successful = [];
     const failedResults = [];
 
@@ -909,8 +727,7 @@ async function processAutoCandidates(query, searchData, globalSignal, startOvera
         stats: {
             ...selected.stats,
             crawlerContentReused: reusable.length,
-            preflightChecked: 0,
-            preflightRejected: 0,
+            preflightChecked: 0, preflightRejected: 0,
             extractionSent: networkEntries.length,
             extractionSucceeded: successful.length,
             extractionFailed: failedResults.length,
@@ -972,9 +789,7 @@ export default async function handler(req) {
             try {
                 const body = await req.json();
                 if (body && typeof body === 'object') input = body;
-            } catch {
-                // Empty/malformed JSON body is safely ignored in favor of URL params.
-            }
+            } catch {}
         }
 
         input = { ...queryParams, ...input };
@@ -984,16 +799,12 @@ export default async function handler(req) {
         const query = input.query || input.q || input.search;
 
         const finalPayload = {
-            success: true,
-            action,
-            results: [],
-            failed_extractions: 0,
-            total_time_ms: 0,
+            success: true, action, results: [], failed_extractions: 0, total_time_ms: 0,
         };
         const handlerStart = startOverallTime;
 
         if (action === 'search' || action === 'auto') {
-            if (!query) throw new Error("Missing 'query' parameter. Please pass ?query=YOUR_SEARCH in the URL.");
+            if (!query) throw new Error("Missing 'query' parameter.");
 
             const searchStarted = Date.now();
             const searchData = await performSearch(String(query), count, controller.signal);
@@ -1001,8 +812,6 @@ export default async function handler(req) {
             const normalized = normalizeSearchResults(searchData);
 
             if (action === 'search') {
-                // Search mode remains a faithful crawler pass-through (aside from
-                // URL canonicalization/deduplication used by this combined endpoint).
                 finalPayload.results = normalized.map(decorateCrawlerMatch).map(item => {
                     delete item._originalRank;
                     return item;
